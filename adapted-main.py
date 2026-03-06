@@ -32,20 +32,15 @@ class LayerNorm2d(nn.LayerNorm):
 
 class Downsample(nn.Module):
     """
-    Down-sampling block"
+    Down-sampling block: This is added after every stage (from 1 to 4), where we try to create
+    a spatial pyramid by using a 3x3 convolution with stride 2. [We half the resolution]
+    Args:
+        dim: feature size dimension.
+        norm_layer: normalization layer.
+        keep_dim: bool argument for maintaining the resolution.
     """
 
-    def __init__(self,
-                 dim,
-                 keep_dim=False,
-                 ):
-        """
-        Args:
-            dim: feature size dimension.
-            norm_layer: normalization layer.
-            keep_dim: bool argument for maintaining the resolution.
-        """
-
+    def __init__(self, dim, keep_dim=False,):
         super().__init__()
         if keep_dim:
             dim_out = dim
@@ -59,18 +54,17 @@ class Downsample(nn.Module):
         x = self.reduction(x)
         return x
 
-
 class PatchEmbed(nn.Module):
     """
-    Patch embedding block"
+    Patch embedding block: This is disguised under two convolution layers [with kernel 3x3 and
+    stride=2] which is used to make overlapping patches by reducing the resolution by 2.
+    Args:
+        in_chans: number of input channels.
+        in_dim: input dimension.
+        dim: feature size dimension.
     """
 
     def __init__(self, in_chans=3, in_dim=64, dim=96):
-        """
-        Args:
-            in_chans: number of input channels.
-            dim: feature size dimension.
-        """
         # in_dim = 1
         super().__init__()
         self.proj = nn.Identity()
@@ -88,15 +82,19 @@ class PatchEmbed(nn.Module):
         x = self.conv_down(x)
         return x
 
-
 class ConvBlock(nn.Module):
-
-    def __init__(self, dim,
-                 drop_path=0.,
-                 layer_scale=None,
-                 kernel_size=3):
+    """
+    ConvBlock: This is the basic building block of the model. It is a 2-layer convolution block with
+    a skip connection. The dimensions are preserved and it is used for local feature extraction.
+    Args:
+        dim: feature size dimension.
+        drop_path: drop path rate. This is used to control the dropout rate of the skip connection.
+        layer_scale: layer scaling coefficient. This is used to control the scaling of the output of the block.
+        kernel_size: kernel size. This is used to control the size of the convolution kernel.
+    """
+    def __init__(self, dim, drop_path=0., layer_scale=None, kernel_size=3):
+        
         super().__init__()
-
         self.conv1 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1)
         self.norm1 = nn.BatchNorm2d(dim, eps=1e-5)
         self.act1 = nn.GELU(approximate= 'tanh')
@@ -121,7 +119,6 @@ class ConvBlock(nn.Module):
             x = x * self.gamma.view(1, -1, 1, 1)
         x = input + self.drop_path(x)
         return x
-
 
 class MambaVisionMixer(nn.Module):
     def __init__(
