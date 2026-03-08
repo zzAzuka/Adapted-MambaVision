@@ -716,26 +716,86 @@ def compute_iou(preds, targets, num_classes, ignore_index=255):
 
     return np.mean(ious) if ious else 0.0
 
+
+class SegmentationDataset(Dataset):
+    """
+    Local segmentation dataset: loads images and masks from directories.
+    Expects: img_dir and label_dir with matching filenames (e.g. image.jpg / image.png).
+    Masks can be PNG with pixel value = class index (255 = ignore).
+    """
+    def __init__(self, img_dir, label_dir, img_size=512, image_extensions=(".jpg", ".jpeg", ".png")):
+        self.img_dir = Path(img_dir)
+        self.label_dir = Path(label_dir)
+        self.img_size = img_size
+        self.image_paths = []
+        for ext in image_extensions:
+            self.image_paths.extend(self.img_dir.glob(f"*{ext}"))
+        self.image_paths = sorted(self.image_paths)
+
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225],
+        )
+        self.resize = transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.BILINEAR)
+        self.resize_mask = transforms.Resize((img_size, img_size), interpolation=transforms.InterpolationMode.NEAREST)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def _mask_path(self, img_path):
+        stem = img_path.stem
+        for ext in (".png", ".jpg", ".jpeg"):
+            p = self.label_dir / f"{stem}{ext}"
+            if p.exists():
+                return p
+        return self.label_dir / f"{stem}.png"
+
+    def __getitem__(self, idx):
+        img_path = self.image_paths[idx]
+        mask_path = self._mask_path(img_path)
+
+        image = Image.open(img_path).convert("RGB")
+        image = self.resize(image)
+        image = self.to_tensor(image)
+        image = self.normalize(image)
+
+        mask = np.array(Image.open(mask_path))
+        if mask.ndim > 2:
+            mask = mask[:, :, 0]
+        mask = Image.fromarray(mask.astype(np.uint8))
+        mask = self.resize_mask(mask)
+        mask = torch.from_numpy(np.array(mask)).long()
+
+        return image, mask
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
     model.train()
     total_loss = 0.0
+    use_amp = scaler is not None
 
     for batch_idx, (images, masks) in enumerate(loader):
         images = images.to(device)
-        masks  = masks.to(device)
+        masks = masks.to(device)
 
         optimizer.zero_grad()
 
-        # Mixed precision forward pass
-        with torch.cuda.amp.autocast():
-            logits = model(images)                          # (B, C, H, W)
-            loss   = criterion(logits, masks)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        scaler.step(optimizer)
-        scaler.update()
+        if use_amp:
+            with torch.cuda.amp.autocast():
+                logits = model(images)
+                loss = criterion(logits, masks)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(images)
+            loss = criterion(logits, masks)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
         total_loss += loss.item()
 
@@ -745,77 +805,85 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler):
     return total_loss / len(loader)
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, num_classes):
+def validate(model, loader, criterion, device, num_classes, use_amp=True):
     model.eval()
     total_loss = 0.0
-    total_iou  = 0.0
+    total_iou = 0.0
 
     for images, masks in loader:
         images = images.to(device)
-        masks  = masks.to(device)
+        masks = masks.to(device)
 
-        with torch.cuda.amp.autocast():
+        if use_amp and device.type == "cuda":
+            with torch.cuda.amp.autocast():
+                logits = model(images)
+                loss = criterion(logits, masks)
+        else:
             logits = model(images)
-            loss   = criterion(logits, masks)
+            loss = criterion(logits, masks)
 
         total_loss += loss.item()
-        total_iou  += compute_iou(logits, masks, num_classes)
+        total_iou += compute_iou(logits, masks, num_classes)
 
     return total_loss / len(loader), total_iou / len(loader)
 
 def main():
 
-    # ── Dataset Paths ───────────────────────
-    DATA_ROOT = "/kaggle/input/datasets/abhishekprajapat/idd-20k/idd20k_final"
+    # ── Dataset Paths (local) ─────────────────
+    # Override with env vars: DATA_ROOT, OUTPUT_DIR (optional)
+    script_dir = Path(__file__).resolve().parent
+    DATA_ROOT = os.environ.get("DATA_ROOT", str(script_dir / "data"))
+    OUTPUT_DIR = os.environ.get("OUTPUT_DIR", str(script_dir / "outputs"))
 
-    TRAIN_IMG_DIR   = f"{DATA_ROOT}/train/images"
-    TRAIN_LABEL_DIR = f"{DATA_ROOT}/train/labels"
+    TRAIN_IMG_DIR = Path(DATA_ROOT) / "train" / "images"
+    TRAIN_LABEL_DIR = Path(DATA_ROOT) / "train" / "labels"
+    VALID_IMG_DIR = Path(DATA_ROOT) / "valid" / "images"
+    VALID_LABEL_DIR = Path(DATA_ROOT) / "valid" / "labels"
 
-    VALID_IMG_DIR   = f"{DATA_ROOT}/valid/images"
-    VALID_LABEL_DIR = f"{DATA_ROOT}/valid/labels"
-
-    OUTPUT_DIR = "/kaggle/working/outputs"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    print(f"Data root: {DATA_ROOT}")
+    print(f"Output dir: {OUTPUT_DIR}")
 
     # ── Config ──────────────────────────────
     NUM_CLASSES = 26
-    IMG_SIZE    = 512
-    BATCH_SIZE  = 8
-    NUM_EPOCHS  = 50
-    LR          = 1e-4
-    WEIGHT_DECAY= 1e-2
-    IGNORE_INDEX= 255
+    IMG_SIZE = 512
+    BATCH_SIZE = 8
+    NUM_EPOCHS = 50
+    LR = 1e-4
+    WEIGHT_DECAY = 1e-2
+    IGNORE_INDEX = 255
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    PRETRAINED = None
+    print(f"Device: {DEVICE}")
 
     # ── Datasets ────────────────────────────
     train_dataset = SegmentationDataset(
-        TRAIN_IMG_DIR,
-        TRAIN_LABEL_DIR,
-        img_size=IMG_SIZE
+        str(TRAIN_IMG_DIR),
+        str(TRAIN_LABEL_DIR),
+        img_size=IMG_SIZE,
     )
-
     val_dataset = SegmentationDataset(
-        VALID_IMG_DIR,
-        VALID_LABEL_DIR,
-        img_size=IMG_SIZE
+        str(VALID_IMG_DIR),
+        str(VALID_LABEL_DIR),
+        img_size=IMG_SIZE,
     )
+    print(f"Train samples: {len(train_dataset)}  Valid samples: {len(val_dataset)}")
 
     # ── DataLoaders ─────────────────────────
+    num_workers = 0 if os.name == "nt" else 4  # 0 on Windows to avoid multiprocessing issues
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=(DEVICE.type == "cuda"),
     )
-
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=num_workers,
+        pin_memory=(DEVICE.type == "cuda"),
     )
 
     # ── Model ───────────────────────────────
@@ -828,10 +896,6 @@ def main():
         num_classes=0,
     )
 
-    if PRETRAINED:
-        backbone._load_state_dict(PRETRAINED)
-        print(f"Loaded pretrained weights from {PRETRAINED}")
-
     model = MambaVisionSeg(backbone, num_classes=NUM_CLASSES).to(DEVICE)
 
     # ── Loss, Optimizer, Scheduler ──────────
@@ -840,16 +904,16 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=LR,
-        weight_decay=WEIGHT_DECAY
+        weight_decay=WEIGHT_DECAY,
     )
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=NUM_EPOCHS,
-        eta_min=1e-6
+        eta_min=1e-6,
     )
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler() if DEVICE.type == "cuda" else None
 
     # ── Training Loop ───────────────────────
     best_iou = 0.0
@@ -872,7 +936,8 @@ def main():
             val_loader,
             criterion,
             DEVICE,
-            NUM_CLASSES
+            NUM_CLASSES,
+            use_amp=(DEVICE.type == "cuda"),
         )
 
         scheduler.step()
