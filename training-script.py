@@ -22,137 +22,6 @@ from typing import Callable
 
 from torch.utils import checkpoint
 
-def window_partition(x, window_size):
-    """
-    Args:
-        x: (B, C, H, W)
-        window_size: window size
-        h_w: Height of window
-        w_w: Width of window
-    Returns:
-        local window features (num_windows*B, window_size*window_size, C)
-    """
-    B, C, H, W = x.shape
-    x = x.view(B, C, H // window_size, window_size, W // window_size, window_size)
-    windows = x.permute(0, 2, 4, 3, 5, 1).reshape(-1, window_size*window_size, C)
-    return windows
-
-
-def window_reverse(windows, window_size, H, W):
-    """
-    Args:
-        windows: local window features (num_windows*B, window_size, window_size, C)
-        window_size: Window size
-        H: Height of image
-        W: Width of image
-    Returns:
-        x: (B, C, H, W)
-    """
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 5, 1, 3, 2, 4).reshape(B,windows.shape[2], H, W)
-    return x
-
-def _load_state_dict(module, state_dict, strict=False, logger=None):
-    """Load state_dict to a module.
-
-    This method is modified from :meth:`torch.nn.Module.load_state_dict`.
-    Default value for ``strict`` is set to ``False`` and the message for
-    param mismatch will be shown even if strict is False.
-
-    Args:
-        module (Module): Module that receives the state_dict.
-        state_dict (OrderedDict): Weights.
-        strict (bool): whether to strictly enforce that the keys
-            in :attr:`state_dict` match the keys returned by this module's
-            :meth:`~torch.nn.Module.state_dict` function. Default: ``False``.
-        logger (:obj:`logging.Logger`, optional): Logger to log the error
-            message. If not specified, print function will be used.
-    """
-    unexpected_keys = []
-    all_missing_keys = []
-    err_msg = []
-
-    metadata = getattr(state_dict, '_metadata', None)
-    state_dict = state_dict.copy()
-    if metadata is not None:
-        state_dict._metadata = metadata
-    
-    def load(module, prefix=''):
-        local_metadata = {} if metadata is None else metadata.get(
-            prefix[:-1], {})
-        module._load_from_state_dict(state_dict, prefix, local_metadata, True,
-                                     all_missing_keys, unexpected_keys,
-                                     err_msg)
-        for name, child in module._modules.items():
-            if child is not None:
-                load(child, prefix + name + '.')
-
-    load(module)
-    load = None
-    missing_keys = [
-        key for key in all_missing_keys if 'num_batches_tracked' not in key
-    ]
-
-    if unexpected_keys:
-        err_msg.append('unexpected key in source '
-                       f'state_dict: {", ".join(unexpected_keys)}\n')
-    if missing_keys:
-        err_msg.append(
-            f'missing keys in source state_dict: {", ".join(missing_keys)}\n')
-
-    
-    if len(err_msg) > 0:
-        err_msg.insert(
-            0, 'The model and loaded state dict do not match exactly\n')
-        err_msg = '\n'.join(err_msg)
-        if strict:
-            raise RuntimeError(err_msg)
-        elif logger is not None:
-            logger.warning(err_msg)
-        else:
-            print(err_msg)
-
-
-def _load_checkpoint(model,
-                    filename,
-                    map_location='cpu',
-                    strict=False,
-                    logger=None):
-    """Load checkpoint from a file or URI.
-
-    Args:
-        model (Module): Module to load checkpoint.
-        filename (str): Accept local filepath, URL, ``torchvision://xxx``,
-            ``open-mmlab://xxx``. Please refer to ``docs/model_zoo.md`` for
-            details.
-        map_location (str): Same as :func:`torch.load`.
-        strict (bool): Whether to allow different params for the model and
-            checkpoint.
-        logger (:mod:`logging.Logger` or None): The logger for error message.
-
-    Returns:
-        dict or OrderedDict: The loaded checkpoint.
-    """
-    checkpoint = torch.load(filename, map_location=map_location)
-    if not isinstance(checkpoint, dict):
-        raise RuntimeError(
-            f'No state_dict found in checkpoint file {filename}')
-    if 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
-    elif 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    else:
-        state_dict = checkpoint
-    if list(state_dict.keys())[0].startswith('module.'):
-        state_dict = {k[7:]: v for k, v in state_dict.items()}
-
-    if sorted(list(state_dict.keys()))[0].startswith('encoder'):
-        state_dict = {k.replace('encoder.', ''): v for k, v in state_dict.items() if k.startswith('encoder.')}
-
-    _load_state_dict(model, state_dict, strict, logger)
-    return checkpoint
-
 class LayerNorm2d(nn.LayerNorm):
     def forward(self, x: torch.Tensor):
         x = x.permute(0, 2, 3, 1)
@@ -252,28 +121,6 @@ class ConvBlock(nn.Module):
         return x
 
 class MambaVisionMixer(nn.Module):
-    """
-    MambaVisionMixer: This is the core module where we use Mamba architecture. WHen we call this module
-    we make it into two streams, where one does the core-SSM based feature extraction and the other does the 
-    local feature extraction using pure CNN.
-    Args:
-        d_model: feature size dimension.
-        d_state: number of state channels.
-        d_conv: kernel size.
-        expand: expansion factor.
-        dt_rank: rank of the delta tensor.
-        dt_min: minimum value of the delta tensor.
-        dt_max: maximum value of the delta tensor.
-        dt_init: initial value of the delta tensor.
-        dt_scale: scale of the delta tensor.
-        dt_init_floor: floor of the delta tensor.
-        conv_bias: bias of the convolution layer.
-        bias: bias of the linear layer.
-        use_fast_path: use fast path.
-        layer_idx: layer index.
-        device: device.
-        dtype: data type.
-    """
     def __init__(
         self,
         d_model,
@@ -386,17 +233,7 @@ class MambaVisionMixer(nn.Module):
     
 
 class Attention(nn.Module):
-    """
-    Attention: This is the attention module. It is used to extract the global features.
-    Args:
-        dim: feature size dimension.
-        num_heads: number of heads.
-        qkv_bias: bool argument for query, key, value learnable bias.
-        qk_norm: bool argument for query, key normalization.
-        attn_drop: attention dropout rate.
-        proj_drop: projection dropout rate.
-        norm_layer: normalization layer.
-    """
+
     def __init__(
             self,
             dim,
@@ -699,3 +536,454 @@ class MambaVision(nn.Module):
                          pretrained, 
                          strict=strict)
 
+try:
+    from mambavision_model import MambaVision          # put your model file alongside this script
+    MAMBA_AVAILABLE = True
+except ImportError:
+    MAMBA_AVAILABLE = False
+    print("[WARN] mambavision_model not found – using a ResNet-50 stub for smoke-testing.")
+
+
+# ─────────────────────────────────────────────
+# 2.  SEGMENTATION HEAD  (UPerNet-style simple version)
+# ─────────────────────────────────────────────
+class SegmentationHead(nn.Module):
+    """Lightweight FPN-style decoder that sits on top of the MambaVision backbone."""
+
+    def __init__(self, in_channels_list, num_classes, embed_dim=256):
+        super().__init__()
+        # Lateral 1×1 projections
+        self.laterals = nn.ModuleList([
+            nn.Conv2d(c, embed_dim, 1) for c in in_channels_list
+        ])
+        # Output conv
+        self.output_conv = nn.Sequential(
+            nn.Conv2d(embed_dim, embed_dim, 3, padding=1, bias=False),
+            nn.BatchNorm2d(embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(embed_dim, num_classes, 1),
+        )
+
+    def forward(self, features, target_size):
+        # features: list of (B, C, H, W) tensors, coarse→fine order
+        x = self.laterals[-1](features[-1])
+        for i in range(len(features) - 2, -1, -1):
+            x = nn.functional.interpolate(x, size=features[i].shape[-2:], mode='bilinear', align_corners=False)
+            x = x + self.laterals[i](features[i])
+        x = nn.functional.interpolate(x, size=target_size, mode='bilinear', align_corners=False)
+        return self.output_conv(x)
+
+
+# ─────────────────────────────────────────────
+# 3.  FULL SEGMENTATION MODEL
+# ─────────────────────────────────────────────
+class MambaVisionSeg(nn.Module):
+    def __init__(self, num_classes, backbone_cfg: dict):
+        super().__init__()
+        if MAMBA_AVAILABLE:
+            self.backbone = MambaVision(**backbone_cfg)
+            # Remove classification head
+            self.backbone.head = nn.Identity()
+            self.backbone.avgpool = nn.Identity()
+            # Feature channel sizes per stage (dim * 2^i)
+            dim = backbone_cfg.get("dim", 128)
+            depths = backbone_cfg.get("depths", (3, 3, 10, 5))
+            in_ch = [int(dim * 2 ** i) for i in range(len(depths))]
+        else:
+            import torchvision.models as tvm
+            base = tvm.resnet50(weights=None)
+            self.backbone = nn.Sequential(*list(base.children())[:-2])
+            in_ch = [256, 512, 1024, 2048]
+
+        self.seg_head = SegmentationHead(in_ch, num_classes)
+        self._in_ch = in_ch
+
+    def forward(self, x):
+        H, W = x.shape[-2:]
+        if MAMBA_AVAILABLE:
+            feats = []
+            xi = self.backbone.patch_embed(x)
+            for level in self.backbone.levels:
+                xi, skip = level(xi)
+                feats.append(skip)
+        else:
+            # Stub: just get one feature map and replicate
+            feat = self.backbone(x)
+            feats = [feat, feat, feat, feat]
+
+        return self.seg_head(feats, (H, W))
+
+
+# ─────────────────────────────────────────────
+# 4.  DATASETS
+# ─────────────────────────────────────────────
+class SegmentationDataset(Dataset):
+    """
+    Expects:
+        root/images/*.jpg (or .png)
+        root/masks/*.png   (grayscale, values = class indices 0..N-1)
+    """
+    def __init__(self, root, img_size=512, augment=False):
+        self.img_dir  = Path(root) / "images"
+        self.mask_dir = Path(root) / "masks"
+        self.img_size = img_size
+        self.augment  = augment
+        exts = {".jpg", ".jpeg", ".png", ".bmp"}
+        self.imgs = sorted([p for p in self.img_dir.iterdir() if p.suffix.lower() in exts])
+
+    def __len__(self):
+        return len(self.imgs)
+
+    def _sync_transform(self, img, mask):
+        # Resize
+        img  = TF.resize(img,  [self.img_size, self.img_size], interpolation=Image.BILINEAR)
+        mask = TF.resize(mask, [self.img_size, self.img_size], interpolation=Image.NEAREST)
+        if self.augment:
+            # Random horizontal flip
+            if torch.rand(1) > 0.5:
+                img  = TF.hflip(img)
+                mask = TF.hflip(mask)
+            # Random crop
+            i, j, h, w = T.RandomCrop.get_params(img, output_size=(self.img_size, self.img_size))
+            img  = TF.crop(img,  i, j, h, w)
+            mask = TF.crop(mask, i, j, h, w)
+        return img, mask
+
+    def __getitem__(self, idx):
+        img_path  = self.imgs[idx]
+        mask_path = self.mask_dir / (img_path.stem + ".png")
+
+        img  = Image.open(img_path).convert("RGB")
+        mask = Image.open(mask_path)          # keep as-is (grayscale / palette)
+
+        img, mask = self._sync_transform(img, mask)
+
+        img  = TF.to_tensor(img)
+        img  = TF.normalize(img, mean=[0.485, 0.456, 0.406],
+                                  std =[0.229, 0.224, 0.225])
+        mask = torch.as_tensor(np.array(mask), dtype=torch.long)
+        return img, mask
+
+
+def get_classification_loaders(data_dir, img_size=224, batch_size=32, workers=4):
+    train_tf = transforms.Compose([
+        transforms.RandomResizedCrop(img_size),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(0.4, 0.4, 0.4, 0.1),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+    ])
+    val_tf = transforms.Compose([
+        transforms.Resize(int(img_size * 256/224)),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
+    ])
+    train_ds = datasets.ImageFolder(os.path.join(data_dir, "train"), train_tf)
+    val_ds   = datasets.ImageFolder(os.path.join(data_dir, "val"),   val_tf)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=workers, pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=workers, pin_memory=True)
+    return train_loader, val_loader, len(train_ds.classes)
+
+
+def get_segmentation_loaders(data_dir, img_size=512, batch_size=8, workers=4):
+    train_ds = SegmentationDataset(os.path.join(data_dir, "train"), img_size, augment=True)
+    val_ds   = SegmentationDataset(os.path.join(data_dir, "val"),   img_size, augment=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=workers, pin_memory=True, drop_last=True)
+    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
+                              num_workers=workers, pin_memory=True)
+    return train_loader, val_loader
+
+
+# ─────────────────────────────────────────────
+# 5.  METRICS
+# ─────────────────────────────────────────────
+class AverageMeter:
+    def __init__(self): self.reset()
+    def reset(self): self.val = self.avg = self.sum = self.count = 0
+    def update(self, val, n=1):
+        self.val   = val
+        self.sum  += val * n
+        self.count += n
+        self.avg   = self.sum / self.count
+
+
+def compute_miou(preds, labels, num_classes, ignore_index=255):
+    """Mean Intersection-over-Union for a batch."""
+    ious = []
+    preds  = preds.view(-1)
+    labels = labels.view(-1)
+    mask   = labels != ignore_index
+    preds, labels = preds[mask], labels[mask]
+    for cls in range(num_classes):
+        pred_cls  = preds  == cls
+        label_cls = labels == cls
+        inter = (pred_cls & label_cls).sum().item()
+        union = (pred_cls | label_cls).sum().item()
+        if union > 0:
+            ious.append(inter / union)
+    return float(np.mean(ious)) if ious else 0.0
+
+
+def accuracy(output, target, topk=(1,)):
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size).item())
+        return res
+
+
+# ─────────────────────────────────────────────
+# 6.  TRAIN / VALIDATE LOOPS
+# ─────────────────────────────────────────────
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch, task):
+    model.train()
+    loss_meter = AverageMeter()
+    metric_meter = AverageMeter()
+    t0 = time.time()
+
+    for i, (images, targets) in enumerate(loader):
+        images  = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            outputs = model(images)
+            loss    = criterion(outputs, targets)
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+
+        bs = images.size(0)
+        loss_meter.update(loss.item(), bs)
+
+        if task == "classification":
+            acc1 = accuracy(outputs, targets, topk=(1,))[0]
+            metric_meter.update(acc1, bs)
+            metric_name = "Acc@1"
+        else:
+            preds = outputs.argmax(1)
+            miou  = compute_miou(preds.cpu(), targets.cpu(), num_classes=outputs.shape[1])
+            metric_meter.update(miou * 100, bs)
+            metric_name = "mIoU"
+
+        if i % 50 == 0:
+            elapsed = time.time() - t0
+            print(f"  Epoch {epoch} [{i}/{len(loader)}]  "
+                  f"Loss: {loss_meter.avg:.4f}  {metric_name}: {metric_meter.avg:.2f}  "
+                  f"({elapsed:.1f}s)")
+
+    return loss_meter.avg, metric_meter.avg
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device, task, num_classes):
+    model.eval()
+    loss_meter   = AverageMeter()
+    metric_meter = AverageMeter()
+
+    for images, targets in loader:
+        images  = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            outputs = model(images)
+            loss    = criterion(outputs, targets)
+
+        bs = images.size(0)
+        loss_meter.update(loss.item(), bs)
+
+        if task == "classification":
+            acc1 = accuracy(outputs, targets, topk=(1,))[0]
+            metric_meter.update(acc1, bs)
+        else:
+            preds = outputs.argmax(1)
+            miou  = compute_miou(preds.cpu(), targets.cpu(), num_classes=num_classes)
+            metric_meter.update(miou * 100, bs)
+
+    return loss_meter.avg, metric_meter.avg
+
+
+# ─────────────────────────────────────────────
+# 7.  MAIN
+# ─────────────────────────────────────────────
+def parse_args():
+    p = argparse.ArgumentParser("MambaVision Trainer")
+    # Data
+    p.add_argument("--data_dir",    required=True, help="Root of dataset folder")
+    p.add_argument("--task",        default="segmentation", choices=["classification", "segmentation"])
+    p.add_argument("--num_classes", type=int, default=None,
+                   help="Number of classes (auto-detected for classification)")
+    p.add_argument("--img_size",    type=int, default=512)
+    # Training
+    p.add_argument("--epochs",      type=int,   default=100)
+    p.add_argument("--batch_size",  type=int,   default=8)
+    p.add_argument("--lr",          type=float, default=1e-4)
+    p.add_argument("--weight_decay",type=float, default=0.05)
+    p.add_argument("--workers",     type=int,   default=4)
+    # Checkpointing
+    p.add_argument("--output_dir",  default="./checkpoints")
+    p.add_argument("--resume",      default="",  help="Path to checkpoint to resume from")
+    p.add_argument("--pretrained",  default="",  help="Path to pretrained backbone weights")
+    # Model (backbone)
+    p.add_argument("--dim",         type=int,   default=128)
+    p.add_argument("--in_dim",      type=int,   default=64)
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ── Data ──────────────────────────────────
+    if args.task == "classification":
+        train_loader, val_loader, num_classes = get_classification_loaders(
+            args.data_dir, args.img_size, args.batch_size, args.workers)
+        if args.num_classes is not None:
+            num_classes = args.num_classes
+    else:
+        train_loader, val_loader = get_segmentation_loaders(
+            args.data_dir, args.img_size, args.batch_size, args.workers)
+        assert args.num_classes, "Please pass --num_classes for segmentation"
+        num_classes = args.num_classes
+
+    print(f"Task: {args.task}  |  Classes: {num_classes}  |  "
+          f"Train batches: {len(train_loader)}  Val batches: {len(val_loader)}")
+
+    # ── Model ─────────────────────────────────
+    backbone_cfg = dict(
+        dim=args.dim,
+        in_dim=args.in_dim,
+        depths=(3, 3, 10, 5),
+        window_size=(8, 8, 14, 7),
+        num_heads=(2, 4, 8, 16),
+        num_classes=num_classes,
+    )
+
+    if args.task == "segmentation":
+        model = MambaVisionSeg(num_classes=num_classes, backbone_cfg=backbone_cfg)
+    else:
+        if MAMBA_AVAILABLE:
+            model = MambaVision(**backbone_cfg)
+        else:
+            import torchvision.models as tvm
+            model = tvm.resnet50(num_classes=num_classes)
+
+    # Load pretrained backbone
+    if args.pretrained:
+        print(f"Loading pretrained weights from {args.pretrained}")
+        ckpt = torch.load(args.pretrained, map_location="cpu")
+        state = ckpt.get("model", ckpt)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"  Missing keys: {len(missing)}  Unexpected: {len(unexpected)}")
+
+    model = model.to(device)
+
+    # Multi-GPU
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
+
+    # ── Loss ──────────────────────────────────
+    if args.task == "segmentation":
+        criterion = nn.CrossEntropyLoss(ignore_index=255)
+    else:
+        criterion = nn.CrossEntropyLoss()
+
+    # ── Optimizer + Scheduler ─────────────────
+    # Separate weight-decay groups (no decay on biases / norms)
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.ndim == 1 or name.endswith(".bias"):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    optimizer = optim.AdamW([
+        {"params": decay,    "weight_decay": args.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ], lr=args.lr, betas=(0.9, 0.999))
+
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs, eta_min=1e-6)
+    scaler    = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+
+    # ── Resume ────────────────────────────────
+    start_epoch = 0
+    best_metric = 0.0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch  = ckpt["epoch"] + 1
+        best_metric  = ckpt.get("best_metric", 0.0)
+        print(f"Resumed from epoch {start_epoch}")
+
+    # ── Training loop ─────────────────────────
+    history = {"train_loss": [], "val_loss": [], "train_metric": [], "val_metric": []}
+    metric_name = "Acc@1" if args.task == "classification" else "mIoU"
+
+    for epoch in range(start_epoch, args.epochs):
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch+1}/{args.epochs}   LR: {scheduler.get_last_lr()[0]:.2e}")
+        print("="*60)
+
+        train_loss, train_metric = train_one_epoch(
+            model, train_loader, criterion, optimizer, scaler, device, epoch+1, args.task)
+
+        val_loss, val_metric = validate(
+            model, val_loader, criterion, device, args.task, num_classes)
+
+        scheduler.step()
+
+        print(f"\n  ✔ Train  Loss: {train_loss:.4f}  {metric_name}: {train_metric:.2f}")
+        print(f"  ✔ Val    Loss: {val_loss:.4f}  {metric_name}: {val_metric:.2f}")
+
+        # Save history
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_metric"].append(train_metric)
+        history["val_metric"].append(val_metric)
+
+        # Save checkpoint
+        ckpt = {
+            "epoch":       epoch,
+            "model":       model.state_dict(),
+            "optimizer":   optimizer.state_dict(),
+            "scheduler":   scheduler.state_dict(),
+            "best_metric": best_metric,
+            "args":        vars(args),
+        }
+        torch.save(ckpt, os.path.join(args.output_dir, "last.pth"))
+
+        if val_metric > best_metric:
+            best_metric = val_metric
+            torch.save(ckpt, os.path.join(args.output_dir, "best.pth"))
+            print(f"  ★ New best {metric_name}: {best_metric:.2f} — checkpoint saved")
+
+    # Save history JSON
+    with open(os.path.join(args.output_dir, "history.json"), "w") as f:
+        json.dump(history, f, indent=2)
+
+    print(f"\nTraining complete. Best {metric_name}: {best_metric:.2f}")
+    print(f"Checkpoints saved to: {args.output_dir}")
+
+
+if __name__ == "__main__":
+    main()
