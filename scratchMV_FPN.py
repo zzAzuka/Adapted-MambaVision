@@ -1,5 +1,8 @@
 import math
 
+# Global DEBUG flag - set to False to disable debug prints
+DEBUG = True
+
 import torch
 import torch.nn as nn
 from timm.models._builder import resolve_pretrained_cfg
@@ -75,8 +78,11 @@ class SegmentationDataset(Dataset):
 
         label = torch.from_numpy(np.array(label, dtype=np.int64))
 
-        # Ensure label values are in valid range
-        label = torch.clamp(label, 0, self.num_classes - 1)
+        # Preserve 255 for unlabelled/out of ROI pixels (ignore_index in loss)
+        # Only clamp values that are NOT 255
+        label = torch.where(
+            label != 255, torch.clamp(label, 0, self.num_classes - 1), label
+        )
 
         return img, label
 
@@ -303,7 +309,7 @@ class MambaVisionMixer(nn.Module):
         self.conv1d_x = nn.Conv1d(
             in_channels=self.d_inner // 2,
             out_channels=self.d_inner // 2,
-            bias=conv_bias // 2,
+            bias=conv_bias,
             kernel_size=d_conv,
             groups=self.d_inner // 2,
             **factory_kwargs,
@@ -311,7 +317,7 @@ class MambaVisionMixer(nn.Module):
         self.conv1d_z = nn.Conv1d(
             in_channels=self.d_inner // 2,
             out_channels=self.d_inner // 2,
-            bias=conv_bias // 2,
+            bias=conv_bias,
             kernel_size=d_conv,
             groups=self.d_inner // 2,
             **factory_kwargs,
@@ -479,8 +485,15 @@ class Block(nn.Module):
         )
 
     def forward(self, x):
+        DEBUG = False
+        if DEBUG:
+            print(f"[Block] Input shape: {x.shape}")
         x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x)))
+        if DEBUG:
+            print(f"[Block] After mixer: {x.shape}")
         x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+        if DEBUG:
+            print(f"[Block] After mlp: {x.shape}")
         return x
 
 
@@ -573,24 +586,40 @@ class MambaVisionLayer(nn.Module):
         self.window_size = window_size
 
     def forward(self, x):
+        DEBUG = True
         _, _, H, W = x.shape
 
         if self.transformer_block:
             pad_r = (self.window_size - W % self.window_size) % self.window_size
             pad_b = (self.window_size - H % self.window_size) % self.window_size
+            if DEBUG:
+                print(
+                    f"[MambaVisionLayer] Input: {x.shape}, window_size={self.window_size}, pad_b={pad_b}, pad_r={pad_r}"
+                )
             if pad_r > 0 or pad_b > 0:
                 x = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
                 _, _, Hp, Wp = x.shape
+                if DEBUG:
+                    print(f"[MambaVisionLayer] After padding: {x.shape}")
             else:
                 Hp, Wp = H, W
             x = window_partition(x, self.window_size)
+            if DEBUG:
+                print(f"[MambaVisionLayer] After window_partition: {x.shape}")
 
-        for _, blk in enumerate(self.blocks):
+        for i, blk in enumerate(self.blocks):
             x = blk(x)
+            if DEBUG and i == 0:
+                print(f"[MambaVisionLayer] After block 0: {x.shape}")
+
         if self.transformer_block:
             x = window_reverse(x, self.window_size, Hp, Wp)
+            if DEBUG:
+                print(f"[MambaVisionLayer] After window_reverse: {x.shape}")
             if pad_r > 0 or pad_b > 0:
                 x = x[:, :, :H, :W].contiguous()
+                if DEBUG:
+                    print(f"[MambaVisionLayer] After crop: {x.shape}")
         if self.downsample is None:
             return x, x
         return self.downsample(x), x
@@ -758,23 +787,50 @@ class FPNDecoder(nn.Module):
         We process top-down: start from skip3 (coarsest),
         upsample and add skip2, ..., down to skip0.
         """
+        DEBUG = True
+        if DEBUG:
+            print(
+                f"[FPNDecoder] Input features: {[(i, f.shape) for i, f in enumerate(features)]}"
+            )
+
         # Lateral projections
         laterals = [l(f) for l, f in zip(self.laterals, features)]
+        if DEBUG:
+            print(
+                f"[FPNDecoder] After lateral projections: {[(i, l.shape) for i, l in enumerate(laterals)]}"
+            )
 
         # Top-down pathway: start at coarsest (index 3)
         x = laterals[3]
+        if DEBUG:
+            print(f"[FPNDecoder] Starting with lateral[3]: {x.shape}")
         x = self.outputs[3](x)
+        if DEBUG:
+            print(f"[FPNDecoder] After output[3]: {x.shape}")
 
         for i in [2, 1, 0]:
+            target_shape = laterals[i].shape[-2:]
+            if DEBUG:
+                print(f"[FPNDecoder] Upsampling {x.shape} to {target_shape}")
             x = F.interpolate(
                 x, size=laterals[i].shape[-2:], mode="bilinear", align_corners=False
             )
+            if DEBUG:
+                print(
+                    f"[FPNDecoder] After upsample: {x.shape}, lateral[{i}]: {laterals[i].shape}"
+                )
             x = x + laterals[i]
             x = self.outputs[i](x)
+            if DEBUG:
+                print(f"[FPNDecoder] After output[{i}]: {x.shape}")
 
         # x is now at H/4 resolution; upsample 4× to full resolution
+        if DEBUG:
+            print(f"[FPNDecoder] Upsampling from {x.shape} by 4x")
         x = F.interpolate(x, scale_factor=4, mode="bilinear", align_corners=False)
         x = self.seg_head(x)
+        if DEBUG:
+            print(f"[FPNDecoder] Final output shape: {x.shape}")
         return x  # (B, num_classes, H, W)
 
 
@@ -799,15 +855,29 @@ class MambaVisionSeg(nn.Module):
         self.decoder = FPNDecoder(stage_channels, num_classes)
 
     def forward(self, x):
+        DEBUG = True
+        if DEBUG:
+            print(f"[MambaVisionSeg] Input shape: {x.shape}")
         x = self.patch_embed(x)  # (B, dim, H/4, W/4)
+        if DEBUG:
+            print(f"[MambaVisionSeg] After patch_embed: {x.shape}")
 
         skips = []
-        for level in self.levels:
+        for i, level in enumerate(self.levels):
             x, skip = level(x)  # level returns (downsampled, skip)
             skips.append(skip)
+            if DEBUG:
+                print(
+                    f"[MambaVisionSeg] After level {i}: x={x.shape}, skip={skip.shape}"
+                )
         # skips = [s0(H/4), s1(H/8), s2(H/16), s3(H/32)]
 
+        if DEBUG:
+            print(f"[MambaVisionSeg] Calling decoder with {len(skips)} skips")
+
         logits = self.decoder(skips)  # (B, num_classes, H, W)
+        if DEBUG:
+            print(f"[MambaVisionSeg] Output logits shape: {logits.shape}")
         return logits
 
 
@@ -866,6 +936,7 @@ def compute_iou(preds, targets, num_classes, ignore_index=255):
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp=True):
+    DEBUG = True
     model.train()
     total_loss = 0.0
     nan_count = 0
@@ -873,6 +944,11 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp
     for batch_idx, (images, masks) in enumerate(loader):
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+
+        if DEBUG and batch_idx == 0:
+            print(
+                f"[train_one_epoch] Batch 0: images={images.shape}, masks={masks.shape}"
+            )
 
         optimizer.zero_grad()
 
@@ -884,6 +960,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp
         )
         with autocast_ctx:
             logits = model(images)  # (B, C, H, W)
+            if DEBUG and batch_idx == 0:
+                print(f"[train_one_epoch] Batch 0: logits={logits.shape}")
             loss = criterion(logits, masks)
 
         # NaN/Inf loss checking (Detects and skips batches with NaN or Inf loss)
@@ -907,6 +985,10 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp
 
         if batch_idx % 20 == 0:
             print(f"  Batch [{batch_idx}/{len(loader)}]  Loss: {loss.item():.4f}")
+            if batch_idx == 0:
+                print(
+                    "  [DEBUG] First batch shapes printed above. Subsequent batches will show loss only."
+                )
 
     if nan_count > 0:
         print(f"  WARNING: Skipped {nan_count} batches due to NaN/Inf loss")
@@ -955,7 +1037,6 @@ def validate(model, loader, criterion, device, num_classes, use_amp=True):
 
 
 def main():
-
     # ── Dataset Paths ───────────────────────
     DATA_ROOT = "/home/shch/mamba_3neurons/idd20k_final"
 
@@ -970,7 +1051,7 @@ def main():
     # ── Config ──────────────────────────────
     NUM_CLASSES = 26
     IMG_SIZE = 512
-    BATCH_SIZE = 16  # Increased for A40 GPU (46GB VRAM)
+    BATCH_SIZE = 32  # Increased for A40 GPU (46GB VRAM)
     NUM_EPOCHS = 50
     LR = 1e-4
     WEIGHT_DECAY = 1e-2
@@ -991,6 +1072,7 @@ def main():
     if DEVICE.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    print(f"DEBUG MODE: {'ENABLED' if DEBUG else 'DISABLED'}")
 
     # ── Create Output Directory ────────────
     os.makedirs(OUTPUT_DIR, exist_ok=True)
