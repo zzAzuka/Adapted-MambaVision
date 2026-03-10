@@ -309,7 +309,7 @@ class MambaVisionMixer(nn.Module):
         self.conv1d_x = nn.Conv1d(
             in_channels=self.d_inner // 2,
             out_channels=self.d_inner // 2,
-            bias=conv_bias,
+            bias=conv_bias // 2,
             kernel_size=d_conv,
             groups=self.d_inner // 2,
             **factory_kwargs,
@@ -317,7 +317,7 @@ class MambaVisionMixer(nn.Module):
         self.conv1d_z = nn.Conv1d(
             in_channels=self.d_inner // 2,
             out_channels=self.d_inner // 2,
-            bias=conv_bias,
+            bias=conv_bias // 2,
             kernel_size=d_conv,
             groups=self.d_inner // 2,
             **factory_kwargs,
@@ -365,10 +365,9 @@ class MambaVisionMixer(nn.Module):
             B,
             C,
             self.D.float(),
-            z=None,
             delta_bias=self.dt_proj.bias.float(),
             delta_softplus=True,
-            return_last_state=None,
+            return_last_state=False,
         )
 
         y = torch.cat([y, z], dim=1)
@@ -465,7 +464,7 @@ class Block(nn.Module):
                 norm_layer=norm_layer,
             )
         else:
-            self.mixer = MambaVisionMixer(d_model=dim, d_state=8, d_conv=3, expand=1)
+            self.mixer = MambaVisionMixer(d_model=dim, d_state=16, d_conv=4, expand=2)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -1051,7 +1050,7 @@ def main():
     # ── Config ──────────────────────────────
     NUM_CLASSES = 26
     IMG_SIZE = 512
-    BATCH_SIZE = 32  # Increased for A40 GPU (46GB VRAM)
+    BATCH_SIZE = 16  # Increased for A40 GPU (46GB VRAM)
     NUM_EPOCHS = 50
     LR = 1e-4
     WEIGHT_DECAY = 1e-2
