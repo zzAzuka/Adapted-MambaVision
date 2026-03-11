@@ -1,7 +1,7 @@
 import math
 
 # Global DEBUG flag - set to False to disable debug prints
-DEBUG = True
+DEBUG = False
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from tqdm import tqdm
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from PIL import Image
 from timm.models.layers import DropPath, trunc_normal_
@@ -585,7 +586,7 @@ class MambaVisionLayer(nn.Module):
         self.window_size = window_size
 
     def forward(self, x):
-        DEBUG = True
+        DEBUG = False
         _, _, H, W = x.shape
 
         if self.transformer_block:
@@ -786,7 +787,7 @@ class FPNDecoder(nn.Module):
         We process top-down: start from skip3 (coarsest),
         upsample and add skip2, ..., down to skip0.
         """
-        DEBUG = True
+        DEBUG = False
         if DEBUG:
             print(
                 f"[FPNDecoder] Input features: {[(i, f.shape) for i, f in enumerate(features)]}"
@@ -854,7 +855,7 @@ class MambaVisionSeg(nn.Module):
         self.decoder = FPNDecoder(stage_channels, num_classes)
 
     def forward(self, x):
-        DEBUG = True
+        DEBUG = False
         if DEBUG:
             print(f"[MambaVisionSeg] Input shape: {x.shape}")
         x = self.patch_embed(x)  # (B, dim, H/4, W/4)
@@ -935,7 +936,7 @@ def compute_iou(preds, targets, num_classes, ignore_index=255):
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp=True):
-    DEBUG = True
+    DEBUG = False
     model.train()
     total_loss = 0.0
     nan_count = 0
