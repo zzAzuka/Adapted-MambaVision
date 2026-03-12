@@ -19,13 +19,13 @@ from pathlib import Path
 import numpy as np
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from tqdm import tqdm
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 from PIL import Image
 from timm.models.layers import DropPath, trunc_normal_
 from timm.models.vision_transformer import Mlp  # , #PatchEmbed
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from tqdm import tqdm
 
 
 # Dataset Function
@@ -920,6 +920,7 @@ def compute_iou(preds, targets, num_classes, ignore_index=255):
     """Returns mean IoU over valid classes."""
     preds = preds.argmax(dim=1)  # (B, H, W)
     ious = []
+
     for cls in range(num_classes):
         pred_mask = preds == cls
         target_mask = targets == cls
@@ -929,16 +930,21 @@ def compute_iou(preds, targets, num_classes, ignore_index=255):
         union = ((pred_mask | target_mask) & valid_mask).sum().item()
 
         if union == 0:
-            continue  # class not present, skip
+            continue
+
         ious.append(intersection / union)
 
     return np.mean(ious) if ious else 0.0
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp=True):
+def train_one_epoch(
+    model, loader, optimizer, criterion, device, scaler, num_classes, use_amp=True
+):
     DEBUG = False
     model.train()
+
     total_loss = 0.0
+    total_iou = 0.0
     nan_count = 0
 
     for batch_idx, (images, masks) in enumerate(loader):
@@ -952,21 +958,22 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp
 
         optimizer.zero_grad()
 
-        # Mixed precision forward pass
         autocast_ctx = (
             torch.cuda.amp.autocast()
             if use_amp
             else torch.autocast("cpu", enabled=False)
         )
+
         with autocast_ctx:
-            logits = model(images)  # (B, C, H, W)
+            logits = model(images)
+
             if DEBUG and batch_idx == 0:
                 print(f"[train_one_epoch] Batch 0: logits={logits.shape}")
+
             loss = criterion(logits, masks)
 
-        # NaN/Inf loss checking (Detects and skips batches with NaN or Inf loss)
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  WARNING: NaN/Inf loss detected at batch {batch_idx}, skipping")
+            print(f"WARNING: NaN/Inf loss detected at batch {batch_idx}, skipping")
             nan_count += 1
             continue
 
@@ -981,28 +988,32 @@ def train_one_epoch(model, loader, optimizer, criterion, device, scaler, use_amp
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
+        iou = compute_iou(logits, masks, num_classes)
+
         total_loss += loss.item()
+        total_iou += iou
 
         if batch_idx % 20 == 0:
-            print(f"  Batch [{batch_idx}/{len(loader)}]  Loss: {loss.item():.4f}")
-            if batch_idx == 0:
-                print(
-                    "  [DEBUG] First batch shapes printed above. Subsequent batches will show loss only."
-                )
+            print(
+                f"Batch [{batch_idx}/{len(loader)}]  Loss: {loss.item():.4f}  IoU: {iou:.4f}"
+            )
 
     if nan_count > 0:
-        print(f"  WARNING: Skipped {nan_count} batches due to NaN/Inf loss")
+        print(f"WARNING: Skipped {nan_count} batches due to NaN/Inf loss")
+
+    valid_batches = len(loader) - nan_count
 
     return (
-        total_loss / (len(loader) - nan_count)
-        if nan_count < len(loader)
-        else float("inf")
+        total_loss / valid_batches if valid_batches > 0 else float("inf"),
+        total_iou / valid_batches if valid_batches > 0 else 0.0,
     )
 
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, num_classes, use_amp=True):
+
     model.eval()
+
     total_loss = 0.0
     total_iou = 0.0
     nan_count = 0
@@ -1019,7 +1030,6 @@ def validate(model, loader, criterion, device, num_classes, use_amp=True):
             logits = model(images)
             loss = criterion(logits, masks)
 
-        # NaN/Inf loss checking
         if torch.isnan(loss) or torch.isinf(loss):
             nan_count += 1
             continue
@@ -1028,16 +1038,52 @@ def validate(model, loader, criterion, device, num_classes, use_amp=True):
         total_iou += compute_iou(logits, masks, num_classes)
 
     if nan_count > 0:
-        print(f"  WARNING: Skipped {nan_count} validation batches due to NaN/Inf loss")
+        print(f"WARNING: Skipped {nan_count} validation batches")
 
     valid_batches = len(loader) - nan_count
-    return total_loss / valid_batches if valid_batches > 0 else float(
-        "inf"
-    ), total_iou / valid_batches if valid_batches > 0 else 0.0
+
+    return (
+        total_loss / valid_batches if valid_batches > 0 else float("inf"),
+        total_iou / valid_batches if valid_batches > 0 else 0.0,
+    )
+
+
+def save_training_graph(history, output_dir):
+    import os
+
+    import matplotlib.pyplot as plt
+
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Loss curves
+    ax1.plot(epochs, history["train_loss"], label="Train Loss")
+    ax1.plot(epochs, history["val_loss"], label="Val Loss")
+    ax1.set_title("Loss")
+    ax1.set_xlabel("Epoch")
+    ax1.legend()
+    ax1.grid(True)
+
+    # IoU curves
+    ax2.plot(epochs, history["train_iou"], label="Train IoU")
+    ax2.plot(epochs, history["val_iou"], label="Val IoU")
+    ax2.set_title("IoU")
+    ax2.set_xlabel("Epoch")
+    ax2.legend()
+    ax2.grid(True)
+
+    plt.tight_layout()
+
+    save_path = os.path.join(output_dir, "training_curves.png")
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+
+    print(f"Saved training curves → {save_path}")
 
 
 def main():
-    # ── Dataset Paths ───────────────────────
+
     DATA_ROOT = "/home/shch/mamba_3neurons/idd20k_final"
 
     TRAIN_IMG_DIR = f"{DATA_ROOT}/train/images"
@@ -1046,51 +1092,39 @@ def main():
     VALID_IMG_DIR = f"{DATA_ROOT}/valid/images"
     VALID_LABEL_DIR = f"{DATA_ROOT}/valid/labels"
 
-    OUTPUT_DIR = "/home/shch/mamba_3neurons/outputs"
+    OUTPUT_DIR = "/home/shch/mamba_3neurons/outputs/NV_MV"
 
-    # ── Config ──────────────────────────────
     NUM_CLASSES = 26
     IMG_SIZE = 512
-    BATCH_SIZE = 16  # Increased for A40 GPU (46GB VRAM)
+    BATCH_SIZE = 16
     NUM_EPOCHS = 50
     LR = 1e-4
     WEIGHT_DECAY = 1e-2
     IGNORE_INDEX = 255
 
-    # Early Stopping Config
-    EARLY_STOPPING_PATIENCE = 10  # Stop if no improvement for 10 epochs
-    MIN_DELTA = 0.001  # Minimum change to qualify as improvement
+    EARLY_STOPPING_PATIENCE = 10
+    MIN_DELTA = 0.001
 
-    # LR Warmup Config
-    WARMUP_EPOCHS = 5  # Number of warmup epochs
+    WARMUP_EPOCHS = 5
 
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     PRETRAINED = None
-    USE_AMP = DEVICE.type == "cuda"  # Only use mixed precision on CUDA
+    USE_AMP = DEVICE.type == "cuda"
 
     print(f"Using device: {DEVICE}")
-    if DEVICE.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
-    print(f"DEBUG MODE: {'ENABLED' if DEBUG else 'DISABLED'}")
 
-    # ── Create Output Directory ────────────
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"Output directory: {OUTPUT_DIR}")
 
-    # ── Datasets ────────────────────────────
     train_dataset = SegmentationDataset(
         TRAIN_IMG_DIR, TRAIN_LABEL_DIR, img_size=IMG_SIZE
     )
-
     val_dataset = SegmentationDataset(VALID_IMG_DIR, VALID_LABEL_DIR, img_size=IMG_SIZE)
 
-    # ── DataLoaders ─────────────────────────
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=8,  # Increased for faster data loading
+        num_workers=8,
         pin_memory=True,
         persistent_workers=True,
     )
@@ -1104,7 +1138,6 @@ def main():
         persistent_workers=True,
     )
 
-    # ── Model ───────────────────────────────
     backbone = MambaVision(
         dim=128,
         in_dim=64,
@@ -1116,22 +1149,21 @@ def main():
 
     if PRETRAINED:
         backbone._load_state_dict(PRETRAINED)
-        print(f"Loaded pretrained weights from {PRETRAINED}")
 
     model = MambaVisionSeg(backbone, num_classes=NUM_CLASSES).to(DEVICE)
 
-    # ── Loss, Optimizer, Scheduler ──────────
     criterion = SegmentationLoss(NUM_CLASSES, ignore_index=IGNORE_INDEX)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
 
-    # LR Warmup + Cosine Annealing
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, total_iters=WARMUP_EPOCHS
     )
+
     main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=NUM_EPOCHS - WARMUP_EPOCHS, eta_min=1e-6
     )
+
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
         schedulers=[warmup_scheduler, main_scheduler],
@@ -1140,16 +1172,29 @@ def main():
 
     scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
 
-    # ── Training Loop ───────────────────────
     best_iou = 0.0
     patience_counter = 0
+
+    history = {
+        "train_loss": [],
+        "train_iou": [],
+        "val_loss": [],
+        "val_iou": [],
+    }
 
     for epoch in range(NUM_EPOCHS):
         current_lr = scheduler.get_last_lr()[0]
         print(f"\nEpoch [{epoch + 1}/{NUM_EPOCHS}]  LR: {current_lr:.6f}")
 
-        train_loss = train_one_epoch(
-            model, train_loader, optimizer, criterion, DEVICE, scaler, USE_AMP
+        train_loss, train_iou = train_one_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            DEVICE,
+            scaler,
+            NUM_CLASSES,
+            USE_AMP,
         )
 
         val_loss, val_iou = validate(
@@ -1158,10 +1203,14 @@ def main():
 
         scheduler.step()
 
-        print(f"Train Loss: {train_loss:.4f}")
-        print(f"Val   Loss: {val_loss:.4f} | mIoU: {val_iou:.4f}")
+        print(f"Train Loss: {train_loss:.4f} | Train IoU: {train_iou:.4f}")
+        print(f"Val   Loss: {val_loss:.4f} | Val IoU: {val_iou:.4f}")
 
-        # Early stopping check
+        history["train_loss"].append(train_loss)
+        history["train_iou"].append(train_iou)
+        history["val_loss"].append(val_loss)
+        history["val_iou"].append(val_iou)
+
         if val_iou > best_iou + MIN_DELTA:
             best_iou = val_iou
             patience_counter = 0
@@ -1177,18 +1226,21 @@ def main():
                 f"{OUTPUT_DIR}/best_model.pth",
             )
 
-            print(f"✓ Saved new best model (mIoU={best_iou:.4f})")
+            print(f"Saved new best model (mIoU={best_iou:.4f})")
+
         else:
             patience_counter += 1
-            print(
-                f"No improvement for {patience_counter} epoch(s) (best mIoU={best_iou:.4f})"
-            )
+            print(f"No improvement for {patience_counter} epoch(s)")
 
-            # Check early stopping condition
             if patience_counter >= EARLY_STOPPING_PATIENCE:
                 print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                print(f"Best mIoU: {best_iou:.4f}")
                 break
+
+    save_training_graph(history, OUTPUT_DIR)
+
+    print("\nTraining complete.")
+    print(f"Best mIoU: {best_iou:.4f}")
+    print(f"Outputs saved to: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
